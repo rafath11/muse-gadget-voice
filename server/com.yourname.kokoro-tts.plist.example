@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Example launchd agent (macOS) to run the Kokoro TTS server at login.
+
+  1. Replace YOURNAME and the paths below with your own.
+  2. Save as ~/Library/LaunchAgents/com.yourname.kokoro-tts.plist
+  3. Load it:  launchctl load ~/Library/LaunchAgents/com.yourname.kokoro-tts.plist
+     Restart after editing server.py:  launchctl kickstart -k gui/$(id -u)/com.yourname.kokoro-tts
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.yourname.kokoro-tts</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOURNAME/kokoro-tts/venv/bin/python</string>
+    <string>/Users/YOURNAME/kokoro-tts/server.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/YOURNAME/kokoro-tts</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/YOURNAME/kokoro-tts/server.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOURNAME/kokoro-tts/server.log</string>
+</dict>
+</plist>

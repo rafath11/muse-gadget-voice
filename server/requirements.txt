@@ -1,0 +1,4 @@
+# Python dependencies for server.py (plus ffmpeg on the system PATH —
+# see the README's server setup section).
+kokoro-onnx>=0.6
+numpy
