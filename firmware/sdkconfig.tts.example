@@ -1,0 +1,13 @@
+# Local TTS for Muse gadget replies.
+# Append these lines to the sdkconfig your build uses (for example
+# build-muse-waveshare/sdkconfig), then rebuild. Replace the URL with
+# the LAN address of the machine running server/server.py — the gadget
+# and that machine must be on the same network.
+CONFIG_MUSE_TTS_HTTP=y
+CONFIG_MUSE_TTS_URL="http://192.168.1.50:8880/v1/audio/speech"
+CONFIG_MUSE_TTS_VOICE="af_heart"
+CONFIG_MUSE_TTS_MODEL="kokoro"
+# Leave MUSE_TTS_STREAM off with the included server: it already
+# streams progressively on its own. The flag only adds "stream": true
+# to the request JSON, for third-party providers that require it.
+# CONFIG_MUSE_TTS_STREAM is not set
