@@ -1,0 +1,235 @@
+--- a/esp32/components/muse/Kconfig
++++ b/esp32/components/muse/Kconfig
+@@ -594,6 +594,48 @@
+             them. Needs PSRAM. Without it, voice notes go over Home Link's own
+             session to its paired VM and replies are shown as text.
+ 
++    config MUSE_TTS_HTTP
++        bool "Speak Muse replies through an HTTP TTS service"
++        depends on MUSE_HATCH && SPIRAM
++        default n
++        help
++            POST text to a local or HTTPS speech endpoint returning MP3.
++            A separate task receives audio with bounded buffering and cancels
++            it when the user interrupts. The existing decoder plays replies.
++            Failed synthesis falls back to captions. Typed serial chat stays silent.
++
++    config MUSE_TTS_URL
++        string "Speech endpoint URL"
++        depends on MUSE_TTS_HTTP
++        default ""
++
++    config MUSE_TTS_VOICE
++        string "Speech voice"
++        depends on MUSE_TTS_HTTP
++        default "af_heart"
++
++    config MUSE_TTS_MODEL
++        string "Speech model"
++        depends on MUSE_TTS_HTTP
++        default "kokoro"
++
++    config MUSE_TTS_LANG_CODE
++        string "Speech language code (optional)"
++        depends on MUSE_TTS_HTTP
++        default ""
++        help
++            Send lang_code in the speech JSON, for example e for Spanish
++            with Kokoro. Leave empty for providers that do not use this field.
++
++    config MUSE_TTS_STREAM
++        bool "Request progressive speech generation"
++        depends on MUSE_TTS_HTTP
++        default n
++        help
++            Send stream: true in the speech JSON. The provider must return
++            binary MP3 progressively, not JSON or server-sent events.
++            When disabled, omit the field and use the provider's default.
++
+     config MUSE_REPLY_NOTIFY
+         bool "Flash the screen and ping when a reply arrives"
+         depends on MUSE_HATCH && !MUSE_UI_FREEINK
+--- a/esp32/components/muse/CMakeLists.txt
++++ b/esp32/components/muse/CMakeLists.txt
+@@ -71,6 +71,9 @@
+     endif()
+     if(CONFIG_MUSE_HATCH)
+         list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_options_json.c")
++        if(CONFIG_MUSE_TTS_HTTP)
++            list(APPEND srcs "muse_tts.c")   # local HTTP speech for replies (start_tts)
++        endif()
+         list(APPEND embed "test_reply.mp3")   # muse_hatch_mp3_selftest
+         if(CONFIG_MUSE_RESEND_NOTES)
+             list(APPEND srcs "muse_resend.c")   # when a note that didn't send goes again
+@@ -261,6 +264,9 @@
+     # The Voice PE board uses just the Muse voice session; the project's main/
+     # voice_muse_chat.c stands in for the Muse settings, Wi-Fi and Link hooks.
+     list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_chat_text.c" "muse_text.c")
++    if(CONFIG_MUSE_TTS_HTTP)
++        list(APPEND srcs "muse_tts.c")
++    endif()
+     # The shared session handles option events even without a touchscreen.
+     list(APPEND srcs "muse_options.c" "muse_options_json.c")
+     list(APPEND embed "test_reply.mp3")
+--- a/esp32/components/muse/muse_chat_priv.h
++++ b/esp32/components/muse/muse_chat_priv.h
+@@ -78,9 +78,16 @@
+  * Typed turns leave it out. */
+ #define MUSE_CHAT_SPOKEN_DEVICE "mcu-wearable"
+ 
++/* Spoken-answer rules that travel with every voice note. Meta's Linux client
++ * (send_voice) documents instructions in `message` next to the WAV. The text
++ * is pasted into the JSON as is: keep it free of quotes and backslashes. */
++#define MUSE_VOICE_NOTE_INSTRUCTION \
++    "This query comes from a voice note, never answer in markdown format or with " \
++    "emojis; use plain text, because emojis and markdown cause problems for audio playback."
++
+ /* A voice note is a POST /chat/stream body: NOTE_HEAD, a base64 WAV, NOTE_TAIL. */
+ #define MUSE_HATCH_NOTE_HEAD \
+-    "{\"message\":\"\",\"output_modality\":\"text\",\"device\":\"" MUSE_CHAT_SPOKEN_DEVICE "\"," \
++    "{\"message\":\"" MUSE_VOICE_NOTE_INSTRUCTION "\",\"output_modality\":\"text\",\"device\":\"" MUSE_CHAT_SPOKEN_DEVICE "\"," \
+     "\"items\":[{\"type\":\"file\"," \
+     "\"mime_type\":\"audio/wav\",\"filename\":\"voice_note.wav\",\"data_base64\":\""
+ #define MUSE_HATCH_NOTE_TAIL "\"}]}"
+--- a/esp32/components/muse/muse_chat_session.cpp
++++ b/esp32/components/muse/muse_chat_session.cpp
+@@ -26,8 +26,10 @@
+  *   2. POST /chat/stream with the transcript. The reply arrives as events on
+  *      the connection's long-lived POST /chat/subscribe stream: one or more
+  *      assistant messages, each delta.message_start / text_append / message_done.
+- *   3. Each finished message is spoken from Muse's own MP3 TTS stream for
+- *      that message (see start_tts), or shown at reading pace when speech
++ *   3. Each finished message is spoken by the local HTTP TTS service when
++ *      one is configured (see start_tts: the reply's text goes to it and
++ *      the MP3 it returns is played), falling back to Muse's own MP3 TTS
++ *      stream for that message, or shown at reading pace when speech
+  *      can't be fetched.
+  * A turn has no explicit end event; it settles once every
+  * message is done and nothing has arrived for a few seconds.
+@@ -80,6 +82,7 @@
+ #include "muse_account_api.h"
+ #include "muse_link.h"
+ #include "muse_settings.h"
++#include "muse_tts.h"
+ #include "muse_wifi.h"
+ }
+ #include "muse_chat_priv.h"
+@@ -296,6 +299,7 @@
+     int tts_msg;             /* message being fetched (or shown, speaker off), or -1 */
+     bool silent;             /* speaker off: tts_msg is paced by silence, not fetched */
+     bool tts_legacy;         /* the current speech fetch is the legacy-path retry */
++    uint32_t tts_local;      /* local HTTP TTS request id (muse_tts), or 0 */
+     uint8_t *mp3;            /* MP3_BUF */
+     size_t mp3_len;
+     bool mp3_ended;
+@@ -1134,6 +1138,10 @@
+     s_turn.phase = P_IDLE;
+     s_turn.dict_id = s_turn.chat_id = 0;
+     s_turn.tts_msg = -1;
++    if (s_turn.tts_local) {
++        muse_tts_cancel();
++        s_turn.tts_local = 0;
++    }
+     s_turn.silent = false;
+     s_turn.mp3_len = 0;
+ #if CONFIG_MUSE_PHOTO_NOTES
+@@ -1191,6 +1199,7 @@
+ #endif
+     s_turn.text = text;
+     s_turn.tts_msg = -1;
++    muse_tts_cancel();   /* a previous turn's local speech fetch is stale now */
+     memset(s_marks, 0, sizeof(s_marks));
+     s_reply_shown[0] = '\0';
+     s_turn.start_us = now_us();
+@@ -2227,8 +2236,22 @@
+         s_turn.kbps = 0;
+         s_turn.down_rate = 0;
+         s_turn.tts_legacy = false;
++        s_turn.tts_local = 0;
+         mp3dec_init(&s_turn.dec);
+         s_turn.silent = false;
++        /* Speech comes from the local HTTP TTS service first: it takes the
++         * reply's text and returns MP3, pumped into tts_data() by
++         * pump_local_tts(). Muse's own TTS stream below stays as the
++         * fallback when no local service is configured or it fails. */
++        if (s_turn.texts && s_turn.texts[i * TEXT_MAX]) {
++            s_turn.tts_local = muse_tts_start(s_turn.texts + i * TEXT_MAX);
++        }
++        if (s_turn.tts_local) {
++            mark(M_TTS);
++            ESP_LOGI(TAG, "fetching speech for message %s from the local TTS service", m.id);
++            show_reply_start(m);
++            return;
++        }
+         if (!open_tts_stream(i, false)) {
+             ESP_LOGW(TAG, "TTS open failed; showing %s as text", m.id);
+             pace_as_text(m);
+@@ -2252,6 +2275,44 @@
+     s_turn.mp3_len += len;
+ }
+ 
++/*
++ * Moves MP3 from the local HTTP TTS worker into the decoder's buffer, with
++ * the same backpressure as the stream path (nothing is read while the
++ * buffer is full). When the fetch ends with audio, decode() drains it and
++ * finishes the message. When it fails before any audio arrived, Muse's
++ * own TTS stream is tried for the message, then reading pace.
++ */
++static void pump_local_tts(void)
++{
++    if (!s_turn.tts_local || s_turn.tts_msg < 0) {
++        return;
++    }
++    size_t room = MP3_BUF - s_turn.mp3_len;
++    if (!room) {
++        return;
++    }
++    uint8_t data[2048];
++    muse_tts_status_t status;
++    size_t n = muse_tts_read(s_turn.tts_local, data, room < sizeof(data) ? room : sizeof(data), &status);
++    if (n) {
++        tts_data(data, n);
++    }
++    if (status == MUSE_TTS_PENDING) {
++        return;
++    }
++    int i = s_turn.tts_msg;
++    s_turn.tts_local = 0;
++    if (status == MUSE_TTS_END || s_turn.mp3_len) {
++        s_turn.mp3_ended = true;   /* decode() drains the rest, then finishes */
++    } else if (open_tts_stream(i, false)) {
++        ESP_LOGW(TAG, "local TTS failed; falling back to Muse's speech stream for %s", s_turn.msgs[i].id);
++        mark(M_TTS);
++    } else {
++        ESP_LOGW(TAG, "local TTS failed; showing %s as text", s_turn.msgs[i].id);
++        pace_as_text(s_turn.msgs[i]);
++    }
++}
++
+ static void tts_end(stream_t *s, bool ok)
+ {
+     int i = s->msg;
+@@ -2862,6 +2923,7 @@
+         }
+         if (s_turn.phase == P_WAIT_REPLY) {
+             start_tts();
++            pump_local_tts();
+             decode();
+         }
+         if (!s_connected) {
+@@ -2957,6 +3019,7 @@
+         if (!s.line) lines = false;
+     }
+     s_turn.tts_msg = -1;
++    muse_tts_init();   /* local HTTP speech stays unavailable if it fails; replies fall back */
+ #if CONFIG_MUSE_REALTIME_VOICE
+     muse_voice_call_init();   /* calls stay unavailable if it fails; notes still work */
+ #endif
+@@ -3032,6 +3095,7 @@
+ {
+     uint32_t gen = s_gen.load();
+     ++s_gen;
++    muse_tts_cancel();
+     post(CMD_CANCEL, gen);
+     drain_out();
+ }

@@ -1,0 +1,27 @@
+--- a/esp32/components/muse/muse_audio.c
++++ b/esp32/components/muse/muse_audio.c
+@@ -178,6 +178,24 @@
+             return err;
+         }
+     }
++    if (s_spk) {
++        /* Speaker loudness unlock: the stock esp_codec_dev curve maps the
++         * settings volume 0..100 to -50..0 dB requested, which leaves the
++         * ES8311's DAC register far below its ceiling. Keep the same shape
++         * (0 still mutes: esp_codec_dev hard-codes -96 dB for vol 0), but
++         * let the top ask for +5 dB, so the DAC lands near +8.5 dB. */
++        static esp_codec_dev_vol_map_t s_vol_curve_map[] = {
++            { 0, -50.0f },
++            { 100, 5.0f },
++        };
++        esp_codec_dev_vol_curve_t vol_curve = {
++            .vol_map = s_vol_curve_map,
++            .count = 2,
++        };
++        if (esp_codec_dev_set_vol_curve(s_spk, &vol_curve) != ESP_CODEC_DEV_OK) {
++            ESP_LOGW(TAG, "could not set the speaker volume curve; stock curve kept");
++        }
++    }
+     muse_audio_set_volume(volume);
+     muse_audio_set_mic_gain(mic_gain_db);
+ 
